@@ -6,7 +6,7 @@ const STAGE_MESSAGES = {
   prefilter_done: (data) =>
     `Found ${data.candidates} potential matches from ${data.total_connections?.toLocaleString() || ''} connections`,
   enriching: (data) =>
-    `Attaching profile data for ${data.count} candidates...`,
+    `Fetching LinkedIn profiles for ${data.count} candidates...`,
   ranking: (data) =>
     `Claude is ranking ${data.candidates} candidates and writing outreach messages...`,
 };

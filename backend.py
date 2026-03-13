@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import anthropic
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,6 +45,8 @@ PREFILTER_MODEL = "claude-haiku-4-5-20251001"
 RANK_MODEL = "claude-sonnet-4-6"
 MAX_TO_CLAUDE = 50
 MAX_CONCURRENT_BATCHES = 3
+ENRICHMENT_SERVICE_URL = "http://localhost:8001"
+MAX_LIVE_ENRICHMENTS = 10  # Cap live LinkedIn lookups per search
 
 
 def load_config() -> dict:
@@ -226,6 +229,84 @@ def attach_cached_enrichment(candidates: list[dict]) -> list[dict]:
     return result
 
 
+async def live_enrich_candidate(
+    http_client: httpx.AsyncClient,
+    username: str,
+) -> dict | None:
+    """Fetch a LinkedIn profile via the enrichment bridge service."""
+    try:
+        resp = await http_client.post(
+            f"{ENRICHMENT_SERVICE_URL}/lookup",
+            json={"username": username},
+            timeout=30.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except (httpx.ConnectError, httpx.TimeoutException):
+        pass
+    return None
+
+
+async def enrich_candidates(
+    candidates: list[dict],
+    progress_callback=None,
+) -> list[dict]:
+    """Enrich candidates: use cache first, then live LinkedIn lookup for uncached."""
+    cache = load_cache()
+    result = []
+    to_enrich = []  # (index_in_result, username)
+
+    for c in candidates:
+        username = extract_username(c["url"])
+        enrichment = cache.get(username) if username else None
+        if enrichment:
+            print(f"  Cache hit: {username}")
+        result.append({**c, "enrichment": enrichment})
+        if not enrichment and username:
+            to_enrich.append((len(result) - 1, username))
+
+    # Cap live lookups to avoid slow searches
+    to_enrich = to_enrich[:MAX_LIVE_ENRICHMENTS]
+
+    if not to_enrich:
+        return result
+
+    # Try live enrichment via the bridge service
+    enriched_count = 0
+    async with httpx.AsyncClient() as http_client:
+        # Check if enrichment service is running
+        try:
+            health = await http_client.get(
+                f"{ENRICHMENT_SERVICE_URL}/health", timeout=2.0
+            )
+            service_available = health.status_code == 200
+        except (httpx.ConnectError, httpx.TimeoutException):
+            service_available = False
+
+        if not service_available:
+            print("  Enrichment service not running — using cache only")
+            return result
+
+        print(f"  Live enriching {len(to_enrich)} uncached profiles...")
+
+        for idx, username in to_enrich:
+            enrichment = await live_enrich_candidate(http_client, username)
+            if enrichment:
+                result[idx]["enrichment"] = enrichment
+                # Save to cache for future searches
+                cache[username] = enrichment
+                enriched_count += 1
+                print(f"  Enriched: {username}")
+            if progress_callback:
+                await progress_callback(enriched_count, len(to_enrich))
+
+    if enriched_count > 0:
+        save_cache(cache)
+        print(f"  Live enriched {enriched_count}/{len(to_enrich)} profiles")
+
+    return result
+
+
 # ── Claude deep ranking (Sonnet) ─────────────────────────────────────────────
 
 async def rank_with_claude(
@@ -372,9 +453,12 @@ async def ask_network(req: AskRequest):
 
         yield sse_event("progress", {"stage": "enriching", "count": num_candidates})
 
-        enriched = attach_cached_enrichment(candidates)
+        async def on_enrich_progress(enriched_so_far, total_to_enrich):
+            pass  # SSE progress sent after enrichment completes
+
+        enriched = await enrich_candidates(candidates, on_enrich_progress)
         cached_count = sum(1 for c in enriched if c.get("enrichment"))
-        print(f"Enrichment: {cached_count} cache hits out of {num_candidates}")
+        print(f"Enrichment: {cached_count} profiles enriched out of {num_candidates}")
 
         yield sse_event("progress", {
             "stage": "ranking",

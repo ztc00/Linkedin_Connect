@@ -35,7 +35,7 @@ echo ""
 echo "  Setting up Python environment..."
 $PY -m venv .venv
 source .venv/bin/activate
-pip install --quiet fastapi uvicorn anthropic python-dotenv
+pip install --quiet fastapi uvicorn anthropic python-dotenv httpx
 echo "  ✓ Backend ready"
 
 # Check for Connections.csv
@@ -78,7 +78,9 @@ echo "  Next steps:"
 echo "    1. cd app && npm run generate && cd ..   (score all connections, ~5 min)"
 echo "    2. cd app && npm run dev                 (start frontend — Terminal 1)"
 echo "    3. source .venv/bin/activate && python backend.py   (start backend — Terminal 2)"
+echo "    4. python enrichment_service.py          (optional — Terminal 3, enables live LinkedIn lookups)"
 echo ""
 echo "  The 'Ranked List' tab shows pre-scored prospects."
 echo "  The 'Ask My Network' tab uses Claude AI to search all your connections intelligently."
+echo "  With the enrichment service running, it also fetches LinkedIn profiles for better results."
 echo ""

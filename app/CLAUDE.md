@@ -90,7 +90,13 @@ export ANTHROPIC_API_KEY="their-key"
 python backend.py
 ```
 
-Then tell the user their dashboard is ready. The "Ranked List" tab shows pre-scored prospects, and the "Ask My Network" tab lets them search with natural language.
+Terminal 3 — enrichment service (optional, enables live LinkedIn profile fetching):
+```bash
+source .venv/bin/activate
+python enrichment_service.py
+```
+
+Then tell the user their dashboard is ready. The "Ranked List" tab shows pre-scored prospects, and the "Ask My Network" tab lets them search with natural language. If the enrichment service is running, searches will automatically fetch LinkedIn profiles for candidates.
 
 ## Project Structure
 
@@ -98,6 +104,7 @@ Then tell the user their dashboard is ready. The "Ranked List" tab shows pre-sco
 ├── client_config.json         ← Client profile (goals, voice, CTA)
 ├── Connections.csv            ← Client's LinkedIn data (not committed)
 ├── backend.py                 ← FastAPI backend for "Ask My Network"
+├── enrichment_service.py      ← LinkedIn MCP bridge (live profile fetching)
 ├── enrichment_cache.json      ← Cached LinkedIn enrichment data
 ├── setup.sh                   ← One-command setup script
 ├── app/
@@ -127,7 +134,7 @@ The search pipeline uses Claude AI at every stage — no dumb keyword matching:
 
 1. **Claude Pre-Filter (Haiku, batched)** — sends ALL connections to `claude-haiku-4-5` in batches of 100. Claude intelligently identifies candidates that might match the query, reasoning about company names, languages, industries, and context. Runs 3 batches concurrently.
 
-2. **Enrichment Lookup** — attaches any cached LinkedIn profile data from `enrichment_cache.json`. No live scraping — this is instant. Enrichment can be populated separately via `POST /enrich` (e.g., from Claude Code's LinkedIn MCP tools).
+2. **LinkedIn Enrichment** — for each candidate, checks the cache first. If not cached, calls the enrichment bridge service (`enrichment_service.py` on port 8001) which uses Claude Code's LinkedIn MCP tools to fetch their full LinkedIn profile. Results are cached in `enrichment_cache.json` for future searches. If the enrichment service isn't running, gracefully falls back to cache-only.
 
 3. **Claude Deep Rank (Sonnet)** — sends the pre-filtered candidates (up to 50) to `claude-sonnet-4-6` for final ranking, relevance scoring, and personalized outreach message generation.
 
