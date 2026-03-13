@@ -70,6 +70,51 @@ else
     exit 1
 fi
 
+# Client profile setup
+echo ""
+if [ -f "client_config.json" ]; then
+    echo "  ✓ client_config.json already exists — skipping profile setup"
+else
+    echo "  ─────────────────────────────────────────"
+    echo "  Client Profile Setup"
+    echo "  ─────────────────────────────────────────"
+    echo ""
+    echo "  I need to know a bit about you so the AI can score and"
+    echo "  write outreach messages tailored to your goals."
+    echo ""
+
+    read -r -p "  Your name: " CLIENT_NAME
+    echo ""
+
+    echo "  Q1: What job titles represent your ideal prospect —"
+    read -r -p "      the people who could hire you or buy from you? " Q1
+    echo ""
+
+    echo "  Q2: What industries or types of companies do you target?"
+    read -r -p "      Anything that makes someone extra interesting? " Q2
+    echo ""
+
+    echo "  Q3: How would you describe your communication voice?"
+    read -r -p "      (e.g. casual, formal, direct, friendly) " Q3
+    echo ""
+
+    echo "  Q4: What's the ideal next step after someone reads your message?"
+    read -r -p "      (e.g. book a call, set up a demo) " Q4
+    echo ""
+
+    cat > client_config.json << EOFCONFIG
+{
+  "client_name": "$CLIENT_NAME",
+  "q1_ideal_prospects": "$Q1",
+  "q2_industries_and_signals": "$Q2",
+  "q3_voice": "$Q3",
+  "q4_cta": "$Q4"
+}
+EOFCONFIG
+
+    echo "  ✓ Saved to client_config.json"
+fi
+
 echo ""
 echo "  ─────────────────────────────────────────"
 echo "  ✓ All prerequisites met!"
