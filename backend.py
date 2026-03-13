@@ -47,6 +47,8 @@ MAX_TO_CLAUDE = 50
 MAX_CONCURRENT_BATCHES = 3
 ENRICHMENT_SERVICE_URL = "http://localhost:8001"
 MAX_LIVE_ENRICHMENTS = 10  # Cap live LinkedIn lookups per search
+ENRICHMENT_POLL_TIMEOUT = 120  # Max seconds to wait for enrichment
+ENRICHMENT_POLL_INTERVAL = 3  # Seconds between poll checks
 
 
 def load_config() -> dict:
@@ -216,42 +218,12 @@ def save_cache(cache: dict):
     CACHE_PATH.write_text(json.dumps(cache, indent=2))
 
 
-def attach_cached_enrichment(candidates: list[dict]) -> list[dict]:
-    """Attach any cached enrichment data to candidates. No scraping."""
-    cache = load_cache()
-    result = []
-    for c in candidates:
-        username = extract_username(c["url"])
-        enrichment = cache.get(username) if username else None
-        if enrichment:
-            print(f"  Cache hit: {username}")
-        result.append({**c, "enrichment": enrichment})
-    return result
-
-
-async def live_enrich_candidate(
-    http_client: httpx.AsyncClient,
-    username: str,
-) -> dict | None:
-    """Fetch a LinkedIn profile via the enrichment bridge service."""
-    try:
-        resp = await http_client.post(
-            f"{ENRICHMENT_SERVICE_URL}/lookup",
-            json={"username": username},
-            timeout=30.0,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-    except (httpx.ConnectError, httpx.TimeoutException):
-        pass
-    return None
-
 
 async def enrich_candidates(
     candidates: list[dict],
     progress_callback=None,
 ) -> list[dict]:
-    """Enrich candidates: use cache first, then live LinkedIn lookup for uncached."""
+    """Enrich candidates: use cache first, then enqueue uncached for live LinkedIn lookup."""
     cache = load_cache()
     result = []
     to_enrich = []  # (index_in_result, username)
@@ -271,8 +243,6 @@ async def enrich_candidates(
     if not to_enrich:
         return result
 
-    # Try live enrichment via the bridge service
-    enriched_count = 0
     async with httpx.AsyncClient() as http_client:
         # Check if enrichment service is running
         try:
@@ -287,22 +257,68 @@ async def enrich_candidates(
             print("  Enrichment service not running — using cache only")
             return result
 
-        print(f"  Live enriching {len(to_enrich)} uncached profiles...")
+        # Enqueue all uncached usernames for enrichment
+        usernames_to_enqueue = [username for _, username in to_enrich]
+        try:
+            resp = await http_client.post(
+                f"{ENRICHMENT_SERVICE_URL}/wait-for-enrichment",
+                json={"usernames": usernames_to_enqueue},
+                timeout=5.0,
+            )
+            enqueue_data = resp.json()
+            pending_usernames = set(enqueue_data.get("usernames_pending", []))
+            print(f"  Enqueued {len(pending_usernames)} profiles for enrichment (Claude Code will process the queue)")
+        except (httpx.ConnectError, httpx.TimeoutException):
+            print("  Failed to enqueue — using cache only")
+            return result
 
-        for idx, username in to_enrich:
-            enrichment = await live_enrich_candidate(http_client, username)
-            if enrichment:
-                result[idx]["enrichment"] = enrichment
-                # Save to cache for future searches
-                cache[username] = enrichment
-                enriched_count += 1
-                print(f"  Enriched: {username}")
+        if not pending_usernames:
+            return result
+
+        # Poll for enrichment results (Claude Code processes the queue via LinkedIn MCP)
+        max_wait = ENRICHMENT_POLL_TIMEOUT
+        poll_interval = ENRICHMENT_POLL_INTERVAL
+        elapsed = 0
+        enriched_count = 0
+
+        while elapsed < max_wait and pending_usernames:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            # Check each pending username
+            still_pending = set()
+            for username in pending_usernames:
+                try:
+                    resp = await http_client.get(
+                        f"{ENRICHMENT_SERVICE_URL}/fetch/{username}",
+                        timeout=5.0,
+                    )
+                    data = resp.json()
+                    if data.get("raw_text"):
+                        # Enrichment completed
+                        cache[username] = data
+                        # Update the result entry
+                        for idx, uname in to_enrich:
+                            if uname == username:
+                                result[idx]["enrichment"] = data
+                                break
+                        enriched_count += 1
+                        print(f"  Enriched: {username}")
+                    else:
+                        still_pending.add(username)
+                except (httpx.ConnectError, httpx.TimeoutException):
+                    still_pending.add(username)
+
+            pending_usernames = still_pending
             if progress_callback:
                 await progress_callback(enriched_count, len(to_enrich))
 
-    if enriched_count > 0:
-        save_cache(cache)
-        print(f"  Live enriched {enriched_count}/{len(to_enrich)} profiles")
+        if enriched_count > 0:
+            save_cache(cache)
+            print(f"  Live enriched {enriched_count}/{len(to_enrich)} profiles")
+
+        if pending_usernames:
+            print(f"  Timed out waiting for {len(pending_usernames)} profiles — proceeding with what we have")
 
     return result
 

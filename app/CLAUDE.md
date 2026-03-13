@@ -140,6 +140,25 @@ The search pipeline uses Claude AI at every stage — no dumb keyword matching:
 
 Progress is streamed to the frontend via **Server-Sent Events (SSE)** so users see real-time stage updates.
 
+## How the Enrichment Queue Works
+
+The enrichment service (`enrichment_service.py`, port 8001) acts as a bridge between the backend and Claude Code's LinkedIn MCP tools.
+
+**When a search runs:**
+1. Backend identifies uncached candidates and POSTs their usernames to `/wait-for-enrichment`
+2. The enrichment service adds them to an in-memory queue
+3. Backend polls `/fetch/{username}` every 3 seconds (up to 2 minutes) waiting for results
+
+**Claude Code processes the queue:**
+While the enrichment service is running, Claude Code (with LinkedIn MCP access) should process the queue:
+1. Check `GET /queue` — see pending usernames
+2. Claim one with `POST /claim` — removes it from pending, marks as processing
+3. Call `mcp__linkedin__get_person_profile` with the username
+4. Submit the result to `POST /submit` with `{"username": "...", "raw_text": "..."}`
+5. Repeat until queue is empty
+
+**For any new client:** Start the enrichment service in Terminal 3, then have Claude Code run the enrichment processing loop while searches are happening. Results are cached in `enrichment_cache.json` so each profile only needs to be fetched once.
+
 ## How client_config.json drives the system
 
 Both `generate.js` (batch scoring) and `backend.py` (Ask My Network) read from `client_config.json`:
