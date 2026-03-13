@@ -86,13 +86,42 @@ def extract_username(url: str) -> str | None:
 
 # ── Pre-filter ───────────────────────────────────────────────────────────────
 
+SYNONYM_GROUPS = [
+    {"founder", "co-founder", "cofounder", "fondateur", "co-fondateur", "cofondateur"},
+    {"owner", "proprietor", "proprietaire", "propriétaire"},
+    {"entrepreneur", "founder", "co-founder", "cofounder", "startup", "fondateur", "co-fondateur"},
+    {"ceo", "chief executive", "directeur général", "directeur general", "pdg", "président", "president"},
+    {"cto", "chief technology", "vp engineering", "head of engineering"},
+    {"coo", "chief operating", "head of operations"},
+    {"business", "entreprise", "commercial"},
+    {"manager", "gestionnaire", "directeur", "director", "head"},
+    {"marketing", "growth", "acquisition"},
+    {"sales", "vente", "commercial", "account executive", "bdr", "sdr"},
+    {"engineer", "developer", "développeur", "developpeur", "ingénieur", "ingenieur"},
+    {"consultant", "advisor", "conseiller"},
+    {"freelance", "freelancer", "independent", "indépendant", "independant", "self-employed"},
+    {"small business", "sme", "pme", "startup", "start-up"},
+]
+
+
+def expand_synonyms(tokens: list[str]) -> set[str]:
+    """Expand query tokens with synonyms so related terms match."""
+    expanded = set(tokens)
+    query_joined = " ".join(tokens)
+    for group in SYNONYM_GROUPS:
+        if any(term in query_joined for term in group) or any(t in group for t in tokens):
+            expanded.update(group)
+    return expanded
+
+
 def prefilter(connections: list[dict], query: str) -> list[dict]:
-    """Keyword match on company + position + name. Returns up to MAX_PREFILTER."""
+    """Keyword match with synonym expansion. Returns up to MAX_PREFILTER."""
     tokens = [t.lower() for t in query.split() if len(t) > 2]
+    expanded = expand_synonyms(tokens)
     scored = []
     for c in connections:
         searchable = f"{c['first_name']} {c['last_name']} {c['company']} {c['position']}".lower()
-        hits = sum(1 for t in tokens if t in searchable)
+        hits = sum(1 for t in expanded if t in searchable)
         if hits > 0:
             scored.append((hits, c))
     scored.sort(key=lambda x: x[0], reverse=True)
