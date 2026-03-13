@@ -56,11 +56,18 @@ Ask the user:
 
 Verify the key is set by checking the environment variable before proceeding.
 
-### Step 4: Run the pipeline
+### Step 4: Run setup and pipeline
 
-Once all prerequisites are confirmed, run:
+Once all prerequisites are confirmed, run the setup script which installs everything:
 ```bash
-cd app && npm install && npm run generate
+chmod +x setup.sh && ./setup.sh
+```
+
+This installs frontend (npm) and backend (pip) dependencies, validates the CSV and API key.
+
+Then run the scoring pipeline:
+```bash
+cd app && npm run generate && cd ..
 ```
 
 This will:
@@ -69,12 +76,14 @@ This will:
 - Generate personalized outreach messages for the top 30 prospects in their voice
 - Save results to `app/public/prospects.json`
 
-After the pipeline completes, start the dev server and the backend:
+After the pipeline completes, start both servers:
+
+Terminal 1 — frontend:
 ```bash
 cd app && npm run dev
 ```
 
-In a second terminal:
+Terminal 2 — backend:
 ```bash
 source .venv/bin/activate
 export ANTHROPIC_API_KEY="their-key"
