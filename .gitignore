@@ -1,0 +1,28 @@
+# Personal data — never commit
+Connections.csv
+app/public/Connections.csv
+app/public/prospects.json
+prospects.json
+prospects_ranked.csv
+enrichment_cache.json
+client_config.json
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node
+app/node_modules/
+app/dist/
+
+# OS
+.DS_Store
+
+# Old standalone files (kept for reference locally)
+dashboard.html
+analyze.py
+generate_dashboard.py
+run.py
+sample_Connections.csv
