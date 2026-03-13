@@ -59,8 +59,15 @@ Verify the key is set by checking the environment variable before proceeding.
 ### Step 4: Run setup and pipeline
 
 Once all prerequisites are confirmed, run the setup script which installs everything:
+
+**Mac/Linux:**
 ```bash
 chmod +x setup.sh && ./setup.sh
+```
+
+**Windows (Command Prompt or PowerShell):**
+```cmd
+setup.bat
 ```
 
 This installs frontend (npm) and backend (pip) dependencies, validates the CSV and API key.
@@ -83,18 +90,24 @@ Terminal 1 — frontend:
 cd app && npm run dev
 ```
 
-Terminal 2 — backend:
+Terminal 2 — backend (Mac/Linux):
 ```bash
 source .venv/bin/activate
 export ANTHROPIC_API_KEY="their-key"
+python3 backend.py
+```
+
+Terminal 2 — backend (Windows):
+```cmd
+.venv\Scripts\activate
+set ANTHROPIC_API_KEY=their-key
 python backend.py
 ```
 
 Terminal 3 — enrichment service (optional, enables live LinkedIn profile fetching):
-```bash
-source .venv/bin/activate
-python enrichment_service.py
-```
+
+Mac/Linux: `source .venv/bin/activate && python3 enrichment_service.py`
+Windows: `.venv\Scripts\activate && python enrichment_service.py`
 
 Then tell the user their dashboard is ready. The "Ranked List" tab shows pre-scored prospects, and the "Ask My Network" tab lets them search with natural language. If the enrichment service is running, searches will automatically fetch LinkedIn profiles for candidates.
 
@@ -106,7 +119,8 @@ Then tell the user their dashboard is ready. The "Ranked List" tab shows pre-sco
 ├── backend.py                 ← FastAPI backend for "Ask My Network"
 ├── enrichment_service.py      ← LinkedIn MCP bridge (live profile fetching)
 ├── enrichment_cache.json      ← Cached LinkedIn enrichment data
-├── setup.sh                   ← One-command setup script
+├── setup.sh                   ← Setup script (Mac/Linux)
+├── setup.bat                  ← Setup script (Windows)
 ├── app/
 │   ├── public/
 │   │   ├── Connections.csv    ← Copy of CSV for generate.js
