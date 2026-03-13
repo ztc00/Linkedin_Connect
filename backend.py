@@ -425,73 +425,74 @@ async def ask_network(req: AskRequest):
         raise HTTPException(400, "Query cannot be empty")
 
     async def event_stream():
-        client = anthropic.AsyncAnthropic()
-        cfg = load_config()
+        try:
+            client = anthropic.AsyncAnthropic()
+            cfg = load_config()
 
-        print(f"\n{'='*60}")
-        print(f"Query: {req.query}")
-        print(f"{'='*60}")
+            print(f"\n{'='*60}")
+            print(f"Query: {req.query}")
+            print(f"{'='*60}")
 
-        connections = load_connections()
-        total = len(connections)
-        print(f"Loaded {total} connections")
+            connections = load_connections()
+            total = len(connections)
+            print(f"Loaded {total} connections")
 
-        yield sse_event("progress", {
-            "stage": "prefilter",
-            "batch": 0,
-            "total": (total + PREFILTER_BATCH_SIZE - 1) // PREFILTER_BATCH_SIZE,
-            "total_connections": total,
-        })
+            yield sse_event("progress", {
+                "stage": "prefilter",
+                "batch": 0,
+                "total": (total + PREFILTER_BATCH_SIZE - 1) // PREFILTER_BATCH_SIZE,
+                "total_connections": total,
+            })
 
-        async def on_prefilter_progress(stage, completed, total_batches):
-            pass  # Progress is sent after all batches complete
+            candidates = await claude_prefilter(client, req.query, connections, cfg)
+            num_candidates = len(candidates)
+            print(f"Claude pre-filtered to {num_candidates} candidates")
 
-        candidates = await claude_prefilter(client, req.query, connections, cfg)
-        num_candidates = len(candidates)
-        print(f"Claude pre-filtered to {num_candidates} candidates")
+            yield sse_event("progress", {
+                "stage": "prefilter_done",
+                "candidates": num_candidates,
+                "total_connections": total,
+            })
 
-        yield sse_event("progress", {
-            "stage": "prefilter_done",
-            "candidates": num_candidates,
-            "total_connections": total,
-        })
+            if not candidates:
+                yield sse_event("result", {
+                    "query": req.query,
+                    "total_connections": total,
+                    "prefiltered": 0,
+                    "results": [],
+                    "message": "No matches found in your network.",
+                })
+                yield sse_event("done", {})
+                return
 
-        if not candidates:
+            yield sse_event("progress", {"stage": "enriching", "count": num_candidates})
+
+            enriched = await enrich_candidates(candidates)
+            cached_count = sum(1 for c in enriched if c.get("enrichment"))
+            print(f"Enrichment: {cached_count} profiles enriched out of {num_candidates}")
+
+            yield sse_event("progress", {
+                "stage": "ranking",
+                "candidates": min(num_candidates, MAX_TO_CLAUDE),
+            })
+
+            print("Deep ranking with Claude Sonnet...")
+            ranked = await rank_with_claude(client, req.query, enriched)
+            print(f"Returned {len(ranked)} ranked results")
+
             yield sse_event("result", {
                 "query": req.query,
                 "total_connections": total,
-                "prefiltered": 0,
-                "results": [],
-                "message": "No matches found in your network.",
+                "prefiltered": num_candidates,
+                "results": ranked,
             })
             yield sse_event("done", {})
-            return
 
-        yield sse_event("progress", {"stage": "enriching", "count": num_candidates})
-
-        async def on_enrich_progress(enriched_so_far, total_to_enrich):
-            pass  # SSE progress sent after enrichment completes
-
-        enriched = await enrich_candidates(candidates, on_enrich_progress)
-        cached_count = sum(1 for c in enriched if c.get("enrichment"))
-        print(f"Enrichment: {cached_count} profiles enriched out of {num_candidates}")
-
-        yield sse_event("progress", {
-            "stage": "ranking",
-            "candidates": min(num_candidates, MAX_TO_CLAUDE),
-        })
-
-        print("Deep ranking with Claude Sonnet...")
-        ranked = await rank_with_claude(client, req.query, enriched)
-        print(f"Returned {len(ranked)} ranked results")
-
-        yield sse_event("result", {
-            "query": req.query,
-            "total_connections": total,
-            "prefiltered": num_candidates,
-            "results": ranked,
-        })
-        yield sse_event("done", {})
+        except Exception as e:
+            print(f"ERROR in search pipeline: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            yield sse_event("error", {"message": str(e)})
 
     return StreamingResponse(
         event_stream(),
