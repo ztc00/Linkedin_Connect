@@ -1,9 +1,21 @@
 import { useState, useRef } from 'react';
 
+const STAGE_MESSAGES = {
+  prefilter: (data) =>
+    `Scanning all ${data.total_connections?.toLocaleString() || ''} connections with Claude AI...`,
+  prefilter_done: (data) =>
+    `Found ${data.candidates} potential matches from ${data.total_connections?.toLocaleString() || ''} connections`,
+  enriching: (data) =>
+    `Attaching profile data for ${data.count} candidates...`,
+  ranking: (data) =>
+    `Claude is ranking ${data.candidates} candidates and writing outreach messages...`,
+};
+
 export default function AskNetwork() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [stage, setStage] = useState(null);
   const [error, setError] = useState(null);
   const [copied, setCopied] = useState(null);
   const inputRef = useRef(null);
@@ -15,6 +27,7 @@ export default function AskNetwork() {
     setLoading(true);
     setError(null);
     setResults(null);
+    setStage(null);
 
     try {
       const res = await fetch('http://localhost:8000/ask', {
@@ -23,12 +36,43 @@ export default function AskNetwork() {
         body: JSON.stringify({ query: query.trim() }),
       });
       if (!res.ok) throw new Error(`Server error: ${res.status}`);
-      const data = await res.json();
-      setResults(data);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        let eventType = null;
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ') && eventType) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (eventType === 'progress') {
+                setStage(data);
+              } else if (eventType === 'result') {
+                setResults(data);
+              }
+            } catch {
+              // skip malformed JSON
+            }
+            eventType = null;
+          }
+        }
+      }
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
+      setStage(null);
     }
   };
 
@@ -37,6 +81,10 @@ export default function AskNetwork() {
     setCopied(idx);
     setTimeout(() => setCopied(null), 2000);
   };
+
+  const stageMessage = stage
+    ? (STAGE_MESSAGES[stage.stage]?.(stage) || 'Working...')
+    : 'Starting...';
 
   return (
     <div className="ask-network">
@@ -54,7 +102,7 @@ export default function AskNetwork() {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="e.g. &quot;who works in consulting in New York&quot;"
+          placeholder="e.g. &quot;founders in France in the food industry&quot;"
           disabled={loading}
         />
         <button className="ask-btn" type="submit" disabled={loading || !query.trim()}>
@@ -72,7 +120,7 @@ export default function AskNetwork() {
             <div className="ask-loading-fill" />
           </div>
           <div className="ask-loading-text">
-            Filtering connections and ranking with Claude...
+            {stageMessage}
           </div>
         </div>
       )}
@@ -86,9 +134,9 @@ export default function AskNetwork() {
       {results && results.results && (
         <div className="ask-results">
           <div className="ask-results-meta">
-            {results.results.length} results from {results.total_connections} connections
+            {results.results.length} results from {results.total_connections?.toLocaleString()} connections
             <span className="ask-results-dot">·</span>
-            {results.prefiltered} pre-filtered
+            {results.prefiltered} pre-filtered by AI
           </div>
 
           {results.results.length === 0 && (

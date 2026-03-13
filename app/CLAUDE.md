@@ -99,6 +99,7 @@ Then tell the user their dashboard is ready. The "Ranked List" tab shows pre-sco
 ├── Connections.csv            ← Client's LinkedIn data (not committed)
 ├── backend.py                 ← FastAPI backend for "Ask My Network"
 ├── enrichment_cache.json      ← Cached LinkedIn enrichment data
+├── setup.sh                   ← One-command setup script
 ├── app/
 │   ├── public/
 │   │   ├── Connections.csv    ← Copy of CSV for generate.js
@@ -113,12 +114,24 @@ Then tell the user their dashboard is ready. The "Ranked List" tab shows pre-sco
 │   │       ├── ProspectList.jsx
 │   │       ├── ProspectRow.jsx
 │   │       ├── ProspectModal.jsx
-│   │       ├── AskNetwork.jsx  ← "Ask My Network" search feature
+│   │       ├── AskNetwork.jsx  ← "Ask My Network" search (SSE streaming)
 │   │       ├── TierBadge.jsx
 │   │       └── ScoreBar.jsx
 │   ├── package.json
 │   └── CLAUDE.md              ← This file
 ```
+
+## How "Ask My Network" Works (3-Stage AI Pipeline)
+
+The search pipeline uses Claude AI at every stage — no dumb keyword matching:
+
+1. **Claude Pre-Filter (Haiku, batched)** — sends ALL connections to `claude-haiku-4-5` in batches of 100. Claude intelligently identifies candidates that might match the query, reasoning about company names, languages, industries, and context. Runs 3 batches concurrently.
+
+2. **Enrichment Lookup** — attaches any cached LinkedIn profile data from `enrichment_cache.json`. No live scraping — this is instant. Enrichment can be populated separately via `POST /enrich` (e.g., from Claude Code's LinkedIn MCP tools).
+
+3. **Claude Deep Rank (Sonnet)** — sends the pre-filtered candidates (up to 50) to `claude-sonnet-4-6` for final ranking, relevance scoring, and personalized outreach message generation.
+
+Progress is streamed to the frontend via **Server-Sent Events (SSE)** so users see real-time stage updates.
 
 ## How client_config.json drives the system
 
@@ -130,7 +143,7 @@ Both `generate.js` (batch scoring) and `backend.py` (Ask My Network) read from `
 
 To customize for a new client, just update `client_config.json` and re-run the pipeline.
 
-## Scoring System
+## Scoring System (Ranked List tab)
 
 Each connection is scored on 5 dimensions (0-20 each, 100 total):
 - **Authority**: Seniority and decision-making power relative to client's goals
@@ -143,6 +156,6 @@ Tiers: HOT (≥50) | WARM UP (35-49) | COLD (<35)
 
 ## Tech Stack
 - React 19 + Vite 8
-- FastAPI + Python (Ask My Network backend)
-- Anthropic Claude API (Haiku for batch scoring, Sonnet for Ask My Network)
+- FastAPI + Python (async, SSE streaming)
+- Anthropic Claude API (Haiku for AI pre-filtering, Sonnet for deep ranking)
 - Pure CSS (no framework)

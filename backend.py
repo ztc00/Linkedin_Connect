@@ -1,17 +1,17 @@
 """
 Ask My Network — FastAPI backend
-POST /ask with {"query": "..."} → ranked enriched prospects + outreach messages
+POST /ask with {"query": "..."} → SSE stream with progress + ranked enriched prospects
 
-Enrichment strategy:
-  1. Check enrichment_cache.json first (instant)
-  2. If not cached, skip enrichment — Claude ranks on CSV data alone
-  3. POST /enrich {"username": "..."} lets the frontend trigger on-demand enrichment
-     (designed to be called from Claude Code's MCP tools or a separate scraper)
+Pipeline:
+  1. Claude AI pre-filter (Haiku, batched) — scans ALL connections intelligently
+  2. Attach cached enrichment data (instant lookup)
+  3. Claude deep rank (Sonnet) — final ranking + personalized outreach messages
+  4. Results streamed via Server-Sent Events for real-time progress
 """
 
+import asyncio
 import csv
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -20,7 +20,7 @@ import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -38,8 +38,11 @@ CSV_PATH = BASE / "Connections.csv"
 CACHE_PATH = BASE / "enrichment_cache.json"
 CONFIG_PATH = BASE / "client_config.json"
 
-MAX_PREFILTER = 20
-MAX_TO_CLAUDE = 15
+PREFILTER_BATCH_SIZE = 100
+PREFILTER_MODEL = "claude-haiku-4-5-20251001"
+RANK_MODEL = "claude-sonnet-4-6"
+MAX_TO_CLAUDE = 50
+MAX_CONCURRENT_BATCHES = 3
 
 
 def load_config() -> dict:
@@ -84,48 +87,98 @@ def extract_username(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-# ── Pre-filter ───────────────────────────────────────────────────────────────
+# ── Claude AI Pre-filter (Haiku, batched) ────────────────────────────────────
 
-SYNONYM_GROUPS = [
-    {"founder", "co-founder", "cofounder", "fondateur", "co-fondateur", "cofondateur"},
-    {"owner", "proprietor", "proprietaire", "propriétaire"},
-    {"entrepreneur", "founder", "co-founder", "cofounder", "startup", "fondateur", "co-fondateur"},
-    {"ceo", "chief executive", "directeur général", "directeur general", "pdg", "président", "president"},
-    {"cto", "chief technology", "vp engineering", "head of engineering"},
-    {"coo", "chief operating", "head of operations"},
-    {"business", "entreprise", "commercial"},
-    {"manager", "gestionnaire", "directeur", "director", "head"},
-    {"marketing", "growth", "acquisition"},
-    {"sales", "vente", "commercial", "account executive", "bdr", "sdr"},
-    {"engineer", "developer", "développeur", "developpeur", "ingénieur", "ingenieur"},
-    {"consultant", "advisor", "conseiller"},
-    {"freelance", "freelancer", "independent", "indépendant", "independant", "self-employed"},
-    {"small business", "sme", "pme", "startup", "start-up"},
-]
+async def claude_prefilter_batch(
+    client: anthropic.AsyncAnthropic,
+    query: str,
+    batch: list[dict],
+    batch_offset: int,
+    cfg: dict,
+) -> list[int]:
+    """Send one batch to Haiku and return global indices of relevant connections."""
+    connections_text = "\n".join(
+        f"[{i}] {c['first_name']} {c['last_name']} | {c['position']} | {c['company']} | Connected: {c['connected_on']}"
+        for i, c in enumerate(batch)
+    )
+
+    prompt = f"""You are filtering LinkedIn connections for relevance to a search query.
+
+Query: "{query}"
+
+Client context:
+- Ideal prospects: {cfg['q1_ideal_prospects']}
+- Target industries & signals: {cfg['q2_industries_and_signals']}
+
+For each connection below, decide if they MIGHT be relevant to the query. Be generous and inclusive — use your knowledge to infer things like:
+- Company names that suggest an industry (e.g., "Free'eat" → food industry)
+- Names that suggest a nationality or location
+- Job titles in other languages (e.g., "Co-fondateur" = Co-founder)
+- Companies that are known startups or in specific sectors
+
+If there's any reasonable chance someone matches the query, include them.
+
+Return ONLY a JSON array of the indices that are potentially relevant. Example: [0, 3, 7, 12]
+If none are relevant, return an empty array: []
+
+Connections:
+{connections_text}"""
+
+    response = await client.messages.create(
+        model=PREFILTER_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text = response.content[0].text.strip()
+    text = re.sub(r"^```json?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        local_indices = json.loads(text)
+        if not isinstance(local_indices, list):
+            return []
+        return [batch_offset + i for i in local_indices if 0 <= i < len(batch)]
+    except json.JSONDecodeError:
+        print(f"  Haiku pre-filter returned invalid JSON: {text[:100]}", file=sys.stderr)
+        return []
 
 
-def expand_synonyms(tokens: list[str]) -> set[str]:
-    """Expand query tokens with synonyms so related terms match."""
-    expanded = set(tokens)
-    query_joined = " ".join(tokens)
-    for group in SYNONYM_GROUPS:
-        if any(term in query_joined for term in group) or any(t in group for t in tokens):
-            expanded.update(group)
-    return expanded
+async def claude_prefilter(
+    client: anthropic.AsyncAnthropic,
+    query: str,
+    connections: list[dict],
+    cfg: dict,
+    progress_callback=None,
+) -> list[dict]:
+    """Send all connections to Haiku in batches, return relevant candidates."""
+    batches = []
+    for i in range(0, len(connections), PREFILTER_BATCH_SIZE):
+        batches.append((connections[i:i + PREFILTER_BATCH_SIZE], i))
 
+    total_batches = len(batches)
+    all_indices = []
+    completed = 0
 
-def prefilter(connections: list[dict], query: str) -> list[dict]:
-    """Keyword match with synonym expansion. Returns up to MAX_PREFILTER."""
-    tokens = [t.lower() for t in query.split() if len(t) > 2]
-    expanded = expand_synonyms(tokens)
-    scored = []
-    for c in connections:
-        searchable = f"{c['first_name']} {c['last_name']} {c['company']} {c['position']}".lower()
-        hits = sum(1 for t in expanded if t in searchable)
-        if hits > 0:
-            scored.append((hits, c))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [c for _, c in scored[:MAX_PREFILTER]]
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
+
+    async def run_batch(batch, offset):
+        nonlocal completed
+        async with semaphore:
+            result = await claude_prefilter_batch(client, query, batch, offset, cfg)
+            completed += 1
+            if progress_callback:
+                await progress_callback("prefilter", completed, total_batches)
+            return result
+
+    tasks = [run_batch(batch, offset) for batch, offset in batches]
+    results = await asyncio.gather(*tasks)
+
+    for indices in results:
+        all_indices.extend(indices)
+
+    unique_indices = sorted(set(all_indices))
+    return [connections[i] for i in unique_indices if i < len(connections)]
 
 
 # ── Enrichment cache ─────────────────────────────────────────────────────────
@@ -153,11 +206,14 @@ def attach_cached_enrichment(candidates: list[dict]) -> list[dict]:
     return result
 
 
-# ── Claude ranking ───────────────────────────────────────────────────────────
+# ── Claude deep ranking (Sonnet) ─────────────────────────────────────────────
 
-def rank_with_claude(query: str, candidates: list[dict]) -> list[dict]:
-    """Send candidates to Claude for ranking + outreach messages."""
-    client = anthropic.Anthropic()
+async def rank_with_claude(
+    client: anthropic.AsyncAnthropic,
+    query: str,
+    candidates: list[dict],
+) -> list[dict]:
+    """Send candidates to Claude Sonnet for ranking + outreach messages."""
     cfg = load_config()
 
     candidate_text = ""
@@ -200,9 +256,9 @@ For each candidate, evaluate their relevance to the query and client profile. Th
 
 Only include candidates with relevance_score >= 30. Return valid JSON array only."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
+    response = await client.messages.create(
+        model=RANK_MODEL,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -217,6 +273,12 @@ Only include candidates with relevance_score >= 30. Return valid JSON array only
         return []
 
 
+# ── SSE helpers ──────────────────────────────────────────────────────────────
+
+def sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
 # ── API ──────────────────────────────────────────────────────────────────────
 
 class AskRequest(BaseModel):
@@ -229,37 +291,85 @@ class EnrichRequest(BaseModel):
 
 
 @app.post("/ask")
-def ask_network(req: AskRequest):
+async def ask_network(req: AskRequest):
     if not req.query.strip():
         raise HTTPException(400, "Query cannot be empty")
 
-    print(f"\n{'='*60}")
-    print(f"Query: {req.query}")
-    print(f"{'='*60}")
+    async def event_stream():
+        client = anthropic.AsyncAnthropic()
+        cfg = load_config()
 
-    connections = load_connections()
-    print(f"Loaded {len(connections)} connections")
+        print(f"\n{'='*60}")
+        print(f"Query: {req.query}")
+        print(f"{'='*60}")
 
-    candidates = prefilter(connections, req.query)
-    print(f"Pre-filtered to {len(candidates)} candidates")
+        connections = load_connections()
+        total = len(connections)
+        print(f"Loaded {total} connections")
 
-    if not candidates:
-        return {"query": req.query, "results": [], "message": "No matches found in your network."}
+        yield sse_event("progress", {
+            "stage": "prefilter",
+            "batch": 0,
+            "total": (total + PREFILTER_BATCH_SIZE - 1) // PREFILTER_BATCH_SIZE,
+            "total_connections": total,
+        })
 
-    # Attach cached enrichment (no scraping)
-    enriched = attach_cached_enrichment(candidates)
+        async def on_prefilter_progress(stage, completed, total_batches):
+            pass  # Progress is sent after all batches complete
 
-    # Rank with Claude
-    print("Ranking with Claude...")
-    ranked = rank_with_claude(req.query, enriched)
-    print(f"Returned {len(ranked)} ranked results")
+        candidates = await claude_prefilter(client, req.query, connections, cfg)
+        num_candidates = len(candidates)
+        print(f"Claude pre-filtered to {num_candidates} candidates")
 
-    return {
-        "query": req.query,
-        "total_connections": len(connections),
-        "prefiltered": len(candidates),
-        "results": ranked,
-    }
+        yield sse_event("progress", {
+            "stage": "prefilter_done",
+            "candidates": num_candidates,
+            "total_connections": total,
+        })
+
+        if not candidates:
+            yield sse_event("result", {
+                "query": req.query,
+                "total_connections": total,
+                "prefiltered": 0,
+                "results": [],
+                "message": "No matches found in your network.",
+            })
+            yield sse_event("done", {})
+            return
+
+        yield sse_event("progress", {"stage": "enriching", "count": num_candidates})
+
+        enriched = attach_cached_enrichment(candidates)
+        cached_count = sum(1 for c in enriched if c.get("enrichment"))
+        print(f"Enrichment: {cached_count} cache hits out of {num_candidates}")
+
+        yield sse_event("progress", {
+            "stage": "ranking",
+            "candidates": min(num_candidates, MAX_TO_CLAUDE),
+        })
+
+        print("Deep ranking with Claude Sonnet...")
+        ranked = await rank_with_claude(client, req.query, enriched)
+        print(f"Returned {len(ranked)} ranked results")
+
+        yield sse_event("result", {
+            "query": req.query,
+            "total_connections": total,
+            "prefiltered": num_candidates,
+            "results": ranked,
+        })
+        yield sse_event("done", {})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/enrich")
