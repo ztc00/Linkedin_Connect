@@ -37,6 +37,7 @@ BASE = Path(__file__).parent
 CSV_PATH = BASE / "Connections.csv"
 CACHE_PATH = BASE / "enrichment_cache.json"
 CONFIG_PATH = BASE / "client_config.json"
+PROSPECTS_PATH = BASE / "app" / "public" / "prospects.json"
 
 PREFILTER_BATCH_SIZE = 100
 PREFILTER_MODEL = "claude-haiku-4-5-20251001"
@@ -85,6 +86,25 @@ def load_connections() -> list[dict]:
 def extract_username(url: str) -> str | None:
     m = re.search(r"linkedin\.com/in/([^/?#]+)", url)
     return m.group(1) if m else None
+
+
+# ── Existing messages from Ranked List ────────────────────────────────────────
+
+def load_existing_messages() -> dict:
+    """Load pre-generated messages from prospects.json, keyed by LinkedIn URL."""
+    if not PROSPECTS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(PROSPECTS_PATH.read_text())
+        messages = {}
+        for p in data.get("prospects", []):
+            url = p.get("url", "")
+            msg = p.get("message", "")
+            if url and msg:
+                messages[url] = msg
+        return messages
+    except (json.JSONDecodeError, KeyError):
+        return {}
 
 
 # ── Claude AI Pre-filter (Haiku, batched) ────────────────────────────────────
@@ -215,12 +235,15 @@ async def rank_with_claude(
 ) -> list[dict]:
     """Send candidates to Claude Sonnet for ranking + outreach messages."""
     cfg = load_config()
+    existing_messages = load_existing_messages()
 
     candidate_text = ""
     for i, c in enumerate(candidates[:MAX_TO_CLAUDE]):
         enrichment = ""
         if c.get("enrichment") and c["enrichment"].get("raw_text"):
             enrichment = c["enrichment"]["raw_text"][:800]
+
+        existing_msg = existing_messages.get(c["url"], "")
 
         candidate_text += f"""
 --- Candidate {i+1} ---
@@ -230,6 +253,7 @@ Company: {c['company']}
 Email: {c['email'] or 'N/A'}
 LinkedIn: {c['url']}
 Enriched Profile: {enrichment or 'No additional data'}
+Existing Message: {existing_msg or 'None — write a new one'}
 """
 
     prompt = f"""You are helping {cfg['client_name']} find relevant people in their LinkedIn network.
@@ -252,7 +276,7 @@ For each candidate, evaluate their relevance to the query and client profile. Th
 - "url": LinkedIn URL
 - "relevance_score": 1-100 how relevant they are to the query
 - "reason": 1-2 sentences explaining why they're relevant
-- "message": a personalized LinkedIn outreach message (2-3 sentences). Voice/tone: {cfg['q3_voice']}. Start with "Hey [first name]", reference something specific about them, end with a CTA toward: {cfg['q4_cta']}
+- "message": If the candidate already has an "Existing Message" above, reuse it exactly. Only write a new personalized LinkedIn outreach message (2-3 sentences) for candidates with "None — write a new one". Voice/tone: {cfg['q3_voice']}. Start with "Hey [first name]", reference something specific about them, end with a CTA toward: {cfg['q4_cta']}
 
 Only include candidates with relevance_score >= 30. Return valid JSON array only."""
 
@@ -267,10 +291,18 @@ Only include candidates with relevance_score >= 30. Return valid JSON array only
     text = re.sub(r"\s*```$", "", text)
 
     try:
-        return json.loads(text)
+        ranked = json.loads(text)
     except json.JSONDecodeError:
         print(f"Claude returned invalid JSON: {text[:200]}", file=sys.stderr)
         return []
+
+    # Ensure existing messages are preserved even if Claude rewrote them
+    for r in ranked:
+        url = r.get("url", "")
+        if url in existing_messages and existing_messages[url]:
+            r["message"] = existing_messages[url]
+
+    return ranked
 
 
 # ── SSE helpers ──────────────────────────────────────────────────────────────
